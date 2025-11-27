@@ -828,6 +828,30 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     #
+    # Fine-tuning QuickDraw configs.
+    #
+    TrainConfig(
+        name="pi0_quickdraw",
+        # Model config: Use PI0 for full fine-tuning on QuickDraw dataset
+        model=pi0_config.Pi0Config(
+            action_dim=3,  # QuickDraw actions: [x, y, pen_down]
+            action_horizon=16,  # Predict 16 future action steps
+        ),
+        # Dataset config: Use QuickDraw data config
+        data=LeRobotQuickDrawDataConfig(
+            repo_id="quickdraw",  # LeRobot dataset repo ID
+            base_config=DataConfig(
+                # Load prompts from the "task" field in the dataset
+                prompt_from_task=True,
+            ),
+        ),
+        # Load weights from base PI0 checkpoint for fine-tuning
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # Training hyperparameters
+        num_train_steps=30_000,
+        batch_size=32,
+    ),
+    #
     # Fine-tuning Aloha configs.
     #
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
