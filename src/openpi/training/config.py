@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.quickdraw_policy as quickdraw_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -346,6 +347,80 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotQuickDrawDataConfig(DataConfigFactory):
+    """
+    Config for training on QuickDraw dataset.
+
+    The dataset format (from convert_quickdraw_data_to_lerobot.py):
+    - sketch_image: (256, 256, 3) uint8 image - current drawing/canvas
+    - actions: (512, 3) float32 [x, y, pen_down] absolute coordinates [0-255, 0-255, 0|1]
+    - point_mask: (512,) int32 mask for valid points
+    - task: str natural language prompt (e.g., "Draw me a cat")
+    """
+
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    # Assets configuration: Load normalization stats from base checkpoint.
+    # This is useful for fine-tuning, where we want to reuse the normalization stats
+    # from the base model checkpoint. For training from scratch, you can override this
+    # to use the default assets directory by setting assets=AssetsConfig().
+    assets: AssetsConfig = dataclasses.field(
+        default_factory=lambda: AssetsConfig(
+            assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
+            asset_id="quickdraw",
+        )
+    )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # No repack transform needed - dataset keys already match policy expectations.
+        # The dataset uses: sketch_image, actions, point_mask, task
+        # The policy expects: sketch_image, actions (optional), prompt/task, state (optional)
+        # The QuickDrawInputs transform handles "task" → "prompt" conversion internally.
+        repack_transform = _transforms.Group()
+
+        # Data transforms: QuickDraw-specific input/output handling.
+        # These transforms convert between dataset format and model format:
+        # - QuickDrawInputs: Maps sketch_image → base_0_rgb, extracts state from actions,
+        #   pads wrist images with zeros, handles image format conversion
+        # - QuickDrawOutputs: Extracts first 3 action dims [x, y, pen_down] from model output
+        data_transforms = _transforms.Group(
+            inputs=[quickdraw_policy.QuickDrawInputs(model_type=model_config.model_type)],
+            outputs=[quickdraw_policy.QuickDrawOutputs()],
+        )
+
+        # Note on relative actions (delta actions):
+        # Currently, we use absolute actions [x, y, pen_down] where x, y are absolute coordinates [0-255].
+        # In the future, we might want to consider converting to relative actions (deltas) for better
+        # perturbation robustness. If we decide to do this, we would:
+        # 1. Convert x, y coordinates to deltas: dx = x_t - x_{t-1}, dy = y_t - y_{t-1}
+        # 2. Keep pen_down as absolute (it's already binary)
+        # 3. Add the following transforms:
+        #    delta_action_mask = _transforms.make_bool_mask(2, -1)  # First 2 dims (x, y) are relative
+        #    data_transforms = data_transforms.push(
+        #        inputs=[_transforms.DeltaActions(delta_action_mask)],
+        #        outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        #    )
+        # 4. Update QuickDrawInputs/Outputs to handle relative actions properly
+        # For now, we stick with absolute actions as they match the dataset format directly.
+
+        # Model transforms: standard tokenization, image resizing, action padding.
+        # These are model-agnostic and handle:
+        # - Tokenizing prompts for the language model
+        # - Resizing images to model input size (224x224)
+        # - Padding actions to match model's action_dim
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
