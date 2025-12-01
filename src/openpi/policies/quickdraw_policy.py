@@ -13,7 +13,13 @@ LIFT_PEN_TOKEN = np.array([-1.0, -1.0, 0.0])
 
 def is_lift_pen_token(action: np.ndarray) -> bool:
     """Check if an action is the lift pen token."""
-    return action[0] < 0 or action[1] < 0
+    action = np.asarray(action)
+    # Flatten to handle any shape, then check first two elements
+    action_flat = action.flatten()
+    if len(action_flat) < 2:
+        return False
+    # Use numpy operations to avoid ambiguity
+    return bool(np.any(action_flat[:2] < 0))
 
 
 def make_quickdraw_example() -> dict[str, Any]:
@@ -128,21 +134,25 @@ class QuickDrawInputs(transforms.DataTransformFn):
             for action in actions:
                 if not is_lift_pen_token(action):
                     # Extract [x, y, pen_down] from first valid action
-                    current_state = action[:3].astype(np.float32)
+                    # Flatten to handle any shape, then take first 3 elements
+                    action_flat = np.asarray(action).flatten()
+                    if len(action_flat) >= 3:
+                        current_state = action_flat[:3].astype(np.float32)
                     break
-        else:
+        elif "state" in data:
             # During inference, state should be provided
-            # If not provided, default to origin with pen up
-            if "state" in data:
-                state_data = np.asarray(data["state"])
-                if state_data.size >= 3:
-                    current_state = state_data[:3].astype(np.float32)
-                elif state_data.size >= 2:
+            state_data = np.asarray(data["state"])
+            # Flatten to handle any shape, then extract first 3 elements
+            state_flat = state_data.flatten()
+            if len(state_flat) >= 3:
+                current_state = state_flat[:3].astype(np.float32)
+            elif len(state_flat) >= 2:
                     # If only [x, y] provided, assume pen is up (0.0)
-                    current_state = np.concatenate([state_data[:2].astype(np.float32), np.array([0.0])])
-                else:
-                    current_state = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                current_state = np.concatenate([state_flat[:2].astype(np.float32), np.array([0.0])])
             else:
+                current_state = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        else:
+            # Default to origin with pen up if neither actions nor state provided
                 current_state = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
         inputs = {
