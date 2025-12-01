@@ -850,6 +850,11 @@ _CONFIGS = [
         # Training hyperparameters
         num_train_steps=30_000,
         batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
     ),
     #
     # Fine-tuning Aloha configs.
