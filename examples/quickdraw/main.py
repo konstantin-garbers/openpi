@@ -12,6 +12,7 @@ Key features
 
 from __future__ import annotations
 
+import colorsys
 import dataclasses
 import pathlib
 import time
@@ -24,6 +25,7 @@ import tyro
 
 # Lift pen token used by the QuickDraw policy/dataset
 LIFT_PEN_TOKEN = np.array([-1.0, -1.0, 0.0], dtype=np.float32)
+_DEFAULT_STROKE_COLOR = (0, 0, 0)
 
 
 @dataclasses.dataclass
@@ -36,6 +38,7 @@ class Args:
     drawing_frequency: float = 10.0  # Hz; strokes per second
     max_strokes: int = 256  # Total strokes to execute before stopping
     debug: bool = False  # Save every step if True
+    color_by_time: bool = False  # If True, color strokes by stroke index
 
     # Canvas / output
     image_size: int = 256
@@ -60,6 +63,7 @@ def _draw_step(
     prev_pos: np.ndarray,
     action: np.ndarray,
     pen_down: bool,
+    stroke_color: tuple[int, int, int] = _DEFAULT_STROKE_COLOR,
 ) -> tuple[np.ndarray, np.ndarray, bool]:
     """Apply a single action to the canvas.
 
@@ -68,6 +72,7 @@ def _draw_step(
         prev_pos: Previous (x, y) position.
         action: [x, y, pen_down] or lift-pen token.
         pen_down: Whether pen was down before this action.
+        stroke_color: RGB color used when drawing this stroke.
 
     Returns:
         updated_canvas, new_pos, new_pen_down
@@ -90,7 +95,7 @@ def _draw_step(
         draw = ImageDraw.Draw(img)
         draw.line(
             [(float(prev_pos[0]), float(prev_pos[1])), (float(new_pos[0]), float(new_pos[1]))],
-            fill=(0, 0, 0),
+            fill=stroke_color,
             width=2,
         )
         canvas = np.array(img, dtype=np.uint8)
@@ -112,6 +117,18 @@ def _dummy_prompts() -> Iterable[str]:
 def _save_canvas(canvas: np.ndarray, path: pathlib.Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(canvas).save(path)
+
+
+def _stroke_color_for_index(stroke_index: int, total_strokes: int) -> tuple[int, int, int]:
+    """Return a time-based stroke color scaled to total strokes."""
+    if total_strokes <= 1:
+        return _DEFAULT_STROKE_COLOR
+    idx = min(max(stroke_index, 0), total_strokes - 1)
+    t = idx / float(total_strokes - 1)
+    # Sweep hue from blue (2/3) to red (0); endpoints stay consistent across totals.
+    hue = (1.0 - t) * (2.0 / 3.0)
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.85, 1.0)
+    return (int(255 * r), int(255 * g), int(255 * b))
 
 
 def run(args: Args) -> None:
@@ -147,9 +164,14 @@ def run(args: Args) -> None:
 
             action = action_chunk[actions_from_chunk_completed]
             actions_from_chunk_completed += 1
+            stroke_color = (
+                _stroke_color_for_index(strokes_done, args.max_strokes)
+                if args.color_by_time
+                else _DEFAULT_STROKE_COLOR
+            )
             strokes_done += 1
 
-            canvas, pos, pen_down = _draw_step(canvas, pos, action, pen_down)
+            canvas, pos, pen_down = _draw_step(canvas, pos, action, pen_down, stroke_color)
 
             # Save step if debug
             if args.debug:
