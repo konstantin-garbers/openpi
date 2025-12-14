@@ -836,6 +836,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             action_dim=3,  # QuickDraw actions: [x, y, pen_down]
             action_horizon=16,  # Predict 16 future action steps
+            pi05=True,
         ),
         # Dataset config: Use QuickDraw data config
         data=LeRobotQuickDrawDataConfig(
