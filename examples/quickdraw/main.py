@@ -15,6 +15,7 @@ from __future__ import annotations
 import colorsys
 import dataclasses
 import pathlib
+import threading
 import time
 from typing import Iterable
 
@@ -36,9 +37,12 @@ class Args:
 
     # Drawing control
     drawing_frequency: float = 10.0  # Hz; strokes per second
+    inference_frequency: float | None = None  # Hz; defaults to drawing_frequency when async
     max_strokes: int = 256  # Total strokes to execute before stopping
     debug: bool = False  # Save every step if True
     color_by_time: bool = False  # If True, color strokes by stroke index
+    async_: bool = False  # Run drawing/inference concurrently. CLI flag is --async
+    merging_strategy: str = "average"  # average | replace (async mode only)
 
     # Canvas / output
     image_size: int = 256
@@ -131,11 +135,36 @@ def _stroke_color_for_index(stroke_index: int, total_strokes: int) -> tuple[int,
     return (int(255 * r), int(255 * g), int(255 * b))
 
 
+def _merge_action_chunks(
+    remaining: np.ndarray, new_actions: np.ndarray, strategy: str = "average"
+) -> np.ndarray:
+    """Merge new actions with remaining actions using the requested strategy."""
+    remaining = np.asarray(remaining, dtype=np.float32)
+    new_actions = np.asarray(new_actions, dtype=np.float32)
+
+    if strategy == "average":
+        if remaining.size == 0:
+            return new_actions
+        min_len = min(len(remaining), len(new_actions))
+        averaged = (remaining[:min_len] + new_actions[:min_len]) / 2.0
+        if len(remaining) > min_len:
+            tail = remaining[min_len:]
+        else:
+            tail = new_actions[min_len:]
+        return np.concatenate([averaged, tail], axis=0)
+    elif strategy == "replace":
+        return new_actions
+
+    raise ValueError(f"Unsupported merging strategy: {strategy}")
+
+
 def run(args: Args) -> None:
     policy = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
 
-    hz = max(args.drawing_frequency, 1e-3)
-    step_period = 1.0 / hz
+    drawing_hz = max(args.drawing_frequency, 1e-3)
+    drawing_step_period = 1.0 / drawing_hz
+    inference_hz = max(args.inference_frequency or args.drawing_frequency, 1e-3)
+    inference_step_period = 1.0 / inference_hz
 
     prompts = list(_dummy_prompts())
 
@@ -144,44 +173,126 @@ def run(args: Args) -> None:
         pen_down = False
         pos = np.array([0.0, 0.0], dtype=np.float32)
         strokes_done = 0
-        actions_from_chunk_completed = 0
-        action_chunk: np.ndarray | None = None
 
         # Directory per prompt
         run_dir = args.output_dir / f"prompt_{prompt_idx:02d}"
         debug_dir = run_dir / "steps"
 
-        while strokes_done < args.max_strokes:
-            # Refill action chunk when exhausted
-            if action_chunk is None or actions_from_chunk_completed >= len(action_chunk):
+        if args.async_:
+            action_buffer = np.zeros((0, 3), dtype=np.float32)
+            actions_consumed = 0
+            action_lock = threading.Lock()
+            state_lock = threading.Lock()
+            stop_event = threading.Event()
+
+            def _build_request_snapshot() -> dict[str, np.ndarray | str]:
+                with state_lock:
+                    canvas_snapshot = canvas.copy()
+                    pos_snapshot = pos.copy()
+                    pen_down_snapshot = pen_down
+                return {
+                    "sketch_image": canvas_snapshot,
+                    "state": np.array(
+                        [pos_snapshot[0], pos_snapshot[1], float(pen_down_snapshot)],
+                        dtype=np.float32,
+                    ),
+                    "prompt": prompt,
+                }
+
+            def inference_loop() -> None:
+                nonlocal action_buffer, actions_consumed
+                while not stop_event.is_set():
+                    start_time = time.time()
+                    request = _build_request_snapshot()
+                    new_actions = np.asarray(policy.infer(request)["actions"])
+
+                    with action_lock:
+                        remaining = action_buffer[actions_consumed:]
+                        action_buffer = _merge_action_chunks(
+                            remaining, new_actions, strategy=args.merging_strategy
+                        )
+                        actions_consumed = 0
+
+                    with state_lock:
+                        if strokes_done >= args.max_strokes:
+                            stop_event.set()
+
+                    elapsed = time.time() - start_time
+                    sleep_for = inference_step_period - elapsed
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+
+            def drawing_loop() -> None:
+                nonlocal canvas, pos, pen_down, strokes_done, actions_consumed
+                while not stop_event.is_set():
+                    with action_lock:
+                        if actions_consumed >= len(action_buffer):
+                            action_available = False
+                            action_to_draw = None
+                        else:
+                            action_to_draw = action_buffer[actions_consumed]
+                            actions_consumed += 1
+                            action_available = True
+
+                    if not action_available:
+                        time.sleep(drawing_step_period)
+                        continue
+
+                    with state_lock:
+                        stroke_color = (
+                            _stroke_color_for_index(strokes_done, args.max_strokes)
+                            if args.color_by_time
+                            else _DEFAULT_STROKE_COLOR
+                        )
+                        canvas, pos, pen_down = _draw_step(
+                            canvas, pos, action_to_draw, pen_down, stroke_color
+                        )
+                        strokes_done += 1
+                        current_step = strokes_done
+
+                    if args.debug:
+                        _save_canvas(canvas, debug_dir / f"step_{current_step:04d}.png")
+
+                    if current_step >= args.max_strokes:
+                        stop_event.set()
+                        break
+
+                    time.sleep(drawing_step_period)
+
+            inf_thread = threading.Thread(target=inference_loop, daemon=True)
+            draw_thread = threading.Thread(target=drawing_loop, daemon=True)
+            inf_thread.start()
+            draw_thread.start()
+            draw_thread.join()
+            stop_event.set()
+            inf_thread.join(timeout=2.0)
+        else:
+            # we switch between drawing and inference steps in a loop
+            while strokes_done < args.max_strokes:
                 request = {
                     "sketch_image": canvas,
                     "state": np.array([pos[0], pos[1], float(pen_down)], dtype=np.float32),
                     "prompt": prompt,
                 }
-                action_chunk = np.asarray(policy.infer(request)["actions"])
-                actions_from_chunk_completed = 0
+                action_response = np.asarray(policy.infer(request)["actions"])
+                if action_response.size == 0:
+                    # No actions returned; slow down and retry.
+                    time.sleep(drawing_step_period)
+                    continue
 
-            action = action_chunk[actions_from_chunk_completed]
-            actions_from_chunk_completed += 1
-            stroke_color = (
-                _stroke_color_for_index(strokes_done, args.max_strokes)
-                if args.color_by_time
-                else _DEFAULT_STROKE_COLOR
-            )
-            strokes_done += 1
+                action = action_response[0]
+                stroke_color = (
+                    _stroke_color_for_index(strokes_done, args.max_strokes)
+                    if args.color_by_time
+                    else _DEFAULT_STROKE_COLOR
+                )
+                canvas, pos, pen_down = _draw_step(canvas, pos, action, pen_down, stroke_color)
+                strokes_done += 1
 
-            canvas, pos, pen_down = _draw_step(canvas, pos, action, pen_down, stroke_color)
+                if args.debug:
+                    _save_canvas(canvas, debug_dir / f"step_{strokes_done:04d}.png")
 
-            # Save step if debug
-            if args.debug:
-                _save_canvas(canvas, debug_dir / f"step_{strokes_done:04d}.png")
-
-            # Respect drawing frequency
-            time.sleep(step_period)
-
-            if strokes_done >= args.max_strokes:
-                break
+                time.sleep(drawing_step_period)
 
         # Always save final canvas
         _save_canvas(canvas, run_dir / "final.png")
