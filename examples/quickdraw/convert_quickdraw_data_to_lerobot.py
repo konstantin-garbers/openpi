@@ -237,44 +237,39 @@ def debug_save_drawing(
         xs = valid_points[:, 0]
         ys = valid_points[:, 1]
 
-        # Filter out lift pen tokens for visualization (they have negative coordinates)
+        # Lift-pen tokens have negative coords; keep them so we can break segments
         valid_mask = (xs >= 0) & (ys >= 0)
-        drawing_points = valid_points[valid_mask]
-        
-        if len(drawing_points) > 0:
-            xs_draw = drawing_points[:, 0]
-            ys_draw = drawing_points[:, 1]
-            pen_down_draw = drawing_points[:, 2]
+        pen_down = valid_points[:, 2]
+
+        for i in range(len(valid_points) - 1):
+            # Skip drawing if either endpoint is a lift token
+            if not (valid_mask[i] and valid_mask[i + 1]):
+                continue
+            if not (pen_down[i] > 0.5 and pen_down[i + 1] > 0.5):
+                continue
 
             # Coordinates are already in 0-255 range, clamp to ensure valid pixel values
-            xs_clamped = np.clip(xs_draw, 0, 255).astype(int)
-            ys_clamped = np.clip(ys_draw, 0, 255).astype(int)
+            x0 = int(np.clip(valid_points[i, 0], 0, 255))
+            y0 = int(np.clip(valid_points[i, 1], 0, 255))
+            x1 = int(np.clip(valid_points[i + 1, 0], 0, 255))
+            y1 = int(np.clip(valid_points[i + 1, 1], 0, 255))
 
-            # Draw lines only when pen is down (pen_down > 0.5)
-            # Skip lift pen tokens (they're filtered out above)
-            for i in range(len(xs_clamped) - 1):
-                if pen_down_draw[i] > 0.5 and pen_down_draw[i + 1] > 0.5:
-                    # Both points have pen down - draw line
-                    # Color from blue (start) to red (end) based on position in sequence
-                    color_ratio = i / max(len(xs_clamped) - 1, 1)
-                    color = (
-                        int(255 * color_ratio),
-                        0,
-                        int(255 * (1 - color_ratio)),
-                    )
-                    vis_draw.line(
-                        [(xs_clamped[i], ys_clamped[i]), (xs_clamped[i + 1], ys_clamped[i + 1])],
-                        fill=color,
-                        width=2,
-                    )
-            
-            # Mark lift pen tokens with a special symbol
-            lift_indices = np.where(~valid_mask)[0]
-            for idx in lift_indices:
-                # Draw a small "X" to indicate lift pen token
-                x_pos, y_pos = 10 + (idx % 20) * 12, 10 + (idx // 20) * 12
-                vis_draw.line([(x_pos - 3, y_pos - 3), (x_pos + 3, y_pos + 3)], fill=(255, 0, 0), width=2)
-                vis_draw.line([(x_pos - 3, y_pos + 3), (x_pos + 3, y_pos - 3)], fill=(255, 0, 0), width=2)
+            # Color from blue (start) to red (end) based on position in sequence
+            color_ratio = i / max(len(valid_points) - 1, 1)
+            color = (
+                int(255 * color_ratio),
+                0,
+                int(255 * (1 - color_ratio)),
+            )
+            vis_draw.line([(x0, y0), (x1, y1)], fill=color, width=2)
+        
+        # Mark lift pen tokens with a special symbol
+        lift_indices = np.where(~valid_mask)[0]
+        for idx in lift_indices:
+            # Draw a small "X" to indicate lift pen token
+            x_pos, y_pos = 10 + (idx % 20) * 12, 10 + (idx // 20) * 12
+            vis_draw.line([(x_pos - 3, y_pos - 3), (x_pos + 3, y_pos + 3)], fill=(255, 0, 0), width=2)
+            vis_draw.line([(x_pos - 3, y_pos + 3), (x_pos + 3, y_pos - 3)], fill=(255, 0, 0), width=2)
 
     vis_path = output_dir / f"{index:04d}_{word}_strokes.png"
     vis_image.save(vis_path)
