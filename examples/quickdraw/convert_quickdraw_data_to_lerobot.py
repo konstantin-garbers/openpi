@@ -126,45 +126,73 @@ def create_drawing_prompt(word: str, seed: int | None = None) -> str:
     return template.format(word=word.lower())
 
 
-# Sentinel value for "lift pen" token - coordinates outside valid range (0-255)
-# Format: [x, y, t, pen_down] but we only use x, y, pen_down here (t is added in flatten_points)
-LIFT_PEN_TOKEN = (-1.0, -1.0, 0.0)
+# Pen state flag: -1.0 means lifted, >0 means pen is down
+PEN_LIFTED_VALUE = -1.0
 
 
 def is_lift_pen_token(action: np.ndarray) -> bool:
-    """Check if an action is the lift pen token."""
-    return action[0] < 0 or action[1] < 0
+    """Check if an action lifts the pen (pen_down flag < 0)."""
+    return action[2] < 0
 
 
-def flatten_points(drawing: list[list[list[float]]], max_points: int) -> tuple[np.ndarray, np.ndarray]:
-    """Flatten strokes to a fixed-length sequence of [x, y, pen_down] points.
-    
-    Works with simplified QuickDraw data (no timing info, pre-normalized to 0-255).
-    Normal drawing actions: [x, y, 1.0] where:
-        - x, y are coordinates (0-255)
-        - pen_down=1.0 indicates pen is down (drawing)
-    
-    After each stroke, appends a special "lift pen" token: [-1.0, -1.0, 0.0].
-    The lift pen token indicates the pen should be lifted before the next action.
-    
+def build_actions(
+    drawing: list[list[list[float]]],
+    *,
+    use_relative_actions: bool = True,
+) -> list[tuple[float, float, float]]:
+    """Convert strokes into a sequence of actions (un-padded).
+
+    use_relative_actions:
+        - True (default): actions are deltas from the previous position.
+        - False: actions are absolute coordinates in [0, 255].
     """
-    flattened = []
-    
+    actions: list[tuple[float, float, float]] = []
+    prev_x, prev_y = 0.0, 0.0
+
     for stroke_idx, stroke in enumerate(drawing):
         if len(stroke) < 2:
             continue
         xs, ys = stroke[0], stroke[1]
         if len(xs) != len(ys):
             raise ValueError("Stroke x/y arrays must have the same length.")
-        
-        # Add all points in the stroke with pen_down=1 (drawing actions)
-        for x, y in zip(xs, ys):
-            flattened.append((x, y, 1.0))  # [x, y, pen_down=1]
-        
-        # After each stroke (except possibly the last), append lift pen token
-        # This tells the model to lift the pen before the next stroke
-        if stroke_idx < len(drawing) - 1:  # Don't add lift token after last stroke
-            flattened.append(LIFT_PEN_TOKEN)
+
+        start_x, start_y = float(xs[0]), float(ys[0])
+
+        # Move to the start of the stroke with the pen lifted
+        if use_relative_actions:
+            actions.append((start_x - prev_x, start_y - prev_y, PEN_LIFTED_VALUE))
+            actions.append((0.0, 0.0, 1.0))  # drop the pen at the stroke start
+        else:
+            actions.append((start_x, start_y, PEN_LIFTED_VALUE))
+            actions.append((start_x, start_y, 1.0))
+        prev_x, prev_y = start_x, start_y
+
+        # Draw the stroke with the pen down
+        for x, y in zip(xs[1:], ys[1:]):
+            x_f, y_f = float(x), float(y)
+            if use_relative_actions:
+                dx, dy = x_f - prev_x, y_f - prev_y
+                actions.append((dx, dy, 1.0))
+            else:  # absolute
+                actions.append((x_f, y_f, 1.0))
+            prev_x, prev_y = x_f, y_f
+
+    return actions
+
+
+def flatten_points(
+    drawing: list[list[list[float]]],
+    max_points: int,
+    use_relative_actions: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flatten strokes to a fixed-length sequence of [x, y, pen_state] points.
+    
+    Works with simplified QuickDraw data (no timing info, pre-normalized to 0-255).
+    Supports relative or absolute action encodings. pen_state > 0 means the pen
+    is down, pen_state < 0 means the pen is lifted.
+    
+    """
+    flattened = build_actions(drawing, use_relative_actions=use_relative_actions)
 
     padded_points = np.zeros((max_points, 3), dtype=np.float32)  # [x, y, pen_down]
     mask = np.zeros((max_points,), dtype=np.int32)
@@ -179,25 +207,27 @@ def flatten_points(drawing: list[list[list[float]]], max_points: int) -> tuple[n
     return padded_points, mask
 
 
-def render_drawing(drawing: list[list[list[float]]], image_size: int) -> np.ndarray:
-    """Rasterize strokes to a grayscale image.
-    
-    Simplified dataset coordinates are already in 0-255 range, so we scale
-    them to the target image_size.
-    """
+def drawing_to_image(
+    drawing: list[list[list[float]]],
+    image_size: int,
+) -> np.ndarray:
+    """Rasterize the raw stroke coordinates to a grayscale RGB image."""
     image = Image.new("L", (image_size, image_size), color=255)
     draw = ImageDraw.Draw(image)
-    # Simplified data is already 0-255, scale to target image size
-    scale = image_size / 256.0
 
     for stroke in drawing:
         if len(stroke) < 2:
             continue
         xs, ys = stroke[0], stroke[1]
-        if len(xs) < 2:
-            continue
-        scaled_points = [(float(x) * scale, float(y) * scale) for x, y in zip(xs, ys)]
-        draw.line(scaled_points, fill=0, width=3)
+        if len(xs) != len(ys):
+            raise ValueError("Stroke x/y arrays must have the same length.")
+        points = list(zip(xs, ys))
+        for (x0, y0), (x1, y1) in zip(points[:-1], points[1:]):
+            x0_c = float(np.clip(x0, 0, image_size - 1))
+            y0_c = float(np.clip(y0, 0, image_size - 1))
+            x1_c = float(np.clip(x1, 0, image_size - 1))
+            y1_c = float(np.clip(y1, 0, image_size - 1))
+            draw.line([(x0_c, y0_c), (x1_c, y1_c)], fill=0, width=3)
 
     array = np.array(image, dtype=np.uint8)
     return np.repeat(array[..., None], 3, axis=-1)
@@ -214,19 +244,15 @@ def iter_ndjson_lines(paths: Sequence[Path]) -> Iterable[dict]:
 
 def debug_save_drawing(
     drawing: list[list[list[float]]],
-    image: np.ndarray,
     actions: np.ndarray,
     mask: np.ndarray,
     word: str,
     output_dir: Path,
     index: int,
+    use_relative_actions: bool,
 ) -> None:
     """Save debugging visualizations of a drawing."""
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save the rasterized image
-    img_path = output_dir / f"{index:04d}_{word}_image.png"
-    Image.fromarray(image).save(img_path)
 
     # Save a visualization of the stroke sequence
     vis_image = Image.new("RGB", (256, 256), color="white")
@@ -234,39 +260,42 @@ def debug_save_drawing(
 
     valid_points = actions[mask.astype(bool)]
     if len(valid_points) > 0:
-        xs = valid_points[:, 0]
-        ys = valid_points[:, 1]
+        pen_down_arr = valid_points[:, 2]
 
-        # Lift-pen tokens have negative coords; keep them so we can break segments
-        valid_mask = (xs >= 0) & (ys >= 0)
-        pen_down = valid_points[:, 2]
+        pos = np.array([0.0, 0.0], dtype=np.float32)
+        pen_is_down = False
 
-        for i in range(len(valid_points) - 1):
-            # Skip drawing if either endpoint is a lift token
-            if not (valid_mask[i] and valid_mask[i + 1]):
-                continue
-            if not (pen_down[i] > 0.5 and pen_down[i + 1] > 0.5):
-                continue
+        for i in range(len(valid_points)):
+            action = valid_points[i]
 
-            # Coordinates are already in 0-255 range, clamp to ensure valid pixel values
-            x0 = int(np.clip(valid_points[i, 0], 0, 255))
-            y0 = int(np.clip(valid_points[i, 1], 0, 255))
-            x1 = int(np.clip(valid_points[i + 1, 0], 0, 255))
-            y1 = int(np.clip(valid_points[i + 1, 1], 0, 255))
+            if use_relative_actions:
+                new_pos = pos + action[:2]
+            else:
+                new_pos = action[:2]
 
-            # Color from blue (start) to red (end) based on position in sequence
-            color_ratio = i / max(len(valid_points) - 1, 1)
-            color = (
-                int(255 * color_ratio),
-                0,
-                int(255 * (1 - color_ratio)),
-            )
-            vis_draw.line([(x0, y0), (x1, y1)], fill=color, width=2)
-        
-        # Mark lift pen tokens with a special symbol
-        lift_indices = np.where(~valid_mask)[0]
+            new_pen_down = pen_down_arr[i] > 0.5
+
+            if i > 0:
+                prev_action = valid_points[i - 1]
+                if (not is_lift_pen_token(prev_action)) and pen_is_down and new_pen_down:
+                    color_ratio = (i - 1) / max(len(valid_points) - 1, 1)
+                    color = (
+                        int(255 * color_ratio),
+                        0,
+                        int(255 * (1 - color_ratio)),
+                    )
+                    x0 = int(np.clip(pos[0], 0, 255))
+                    y0 = int(np.clip(pos[1], 0, 255))
+                    x1 = int(np.clip(new_pos[0], 0, 255))
+                    y1 = int(np.clip(new_pos[1], 0, 255))
+                    vis_draw.line([(x0, y0), (x1, y1)], fill=color, width=2)
+
+            pos = new_pos
+            pen_is_down = new_pen_down
+
+        # Mark lift actions with a special symbol
+        lift_indices = np.where(valid_points[:, 2] < 0)[0]
         for idx in lift_indices:
-            # Draw a small "X" to indicate lift pen token
             x_pos, y_pos = 10 + (idx % 20) * 12, 10 + (idx // 20) * 12
             vis_draw.line([(x_pos - 3, y_pos - 3), (x_pos + 3, y_pos + 3)], fill=(255, 0, 0), width=2)
             vis_draw.line([(x_pos - 3, y_pos + 3), (x_pos + 3, y_pos - 3)], fill=(255, 0, 0), width=2)
@@ -281,17 +310,18 @@ def debug_save_drawing(
         f.write(f"Number of valid points: {mask.sum()}\n")
         f.write(f"Total points (with padding): {len(actions)}\n")
         f.write(f"Number of strokes: {len(drawing)}\n")
+        f.write(f"Actions are relative: {use_relative_actions}\n")
         if len(valid_points) > 0:
-            # Separate drawing actions from lift pen tokens
-            drawing_actions = valid_points[(valid_points[:, 0] >= 0) & (valid_points[:, 1] >= 0)]
-            lift_tokens = valid_points[(valid_points[:, 0] < 0) | (valid_points[:, 1] < 0)]
+            # Separate drawing actions from lift actions
+            drawing_actions = valid_points[valid_points[:, 2] >= 0]
+            lift_tokens = valid_points[valid_points[:, 2] < 0]
             
             if len(drawing_actions) > 0:
                 f.write(f"Drawing actions: {len(drawing_actions)}\n")
                 f.write(f"X range: [{drawing_actions[:, 0].min():.1f}, {drawing_actions[:, 0].max():.1f}]\n")
                 f.write(f"Y range: [{drawing_actions[:, 1].min():.1f}, {drawing_actions[:, 1].max():.1f}]\n")
             if len(lift_tokens) > 0:
-                f.write(f"Lift pen tokens: {len(lift_tokens)}\n")
+                f.write(f"Lift actions: {len(lift_tokens)}\n")
 
 
 def main(
@@ -305,6 +335,7 @@ def main(
     debug: bool = False,
     debug_output_dir: str | None = None,
     debug_max_samples: int = 10,
+    use_relative_actions: bool = True,
 ):
     """Convert simplified QuickDraw ndjson files to LeRobot format.
 
@@ -321,6 +352,7 @@ def main(
         debug: Enable debug mode (saves visualizations)
         debug_output_dir: Directory to save debug outputs (default: ./debug_output)
         debug_max_samples: Maximum number of samples to save in debug mode
+        use_relative_actions: If True (default), store relative deltas; else absolute
     """
     # Clean up existing dataset output
     output_path = HF_LEROBOT_HOME / repo_name
@@ -359,9 +391,9 @@ def main(
             "actions": {
                 "dtype": "float32",
                 "shape": (max_points, 3),
-                "names": ["point", "axis"],  # axis: [x, y, pen_down]
-                # Normal actions: [x, y, 1.0] where x,y in [0, 255]
-                # Lift pen token: [-1.0, -1.0, 0.0]
+                "names": ["point", "axis"],  # axis: [x, y, pen_state]
+                # pen_state > 0: pen down, pen_state < 0: pen lifted
+                # Relative actions (default): deltas; Absolute: coordinates in [0, 255]
             },
             "point_mask": {
                 "dtype": "int32",
@@ -381,13 +413,19 @@ def main(
             continue
 
         drawing = entry["drawing"]
-        image = render_drawing(drawing, image_size)
-        actions, mask = flatten_points(drawing, max_points)
+        actions, mask = flatten_points(drawing, max_points, use_relative_actions=use_relative_actions)
+        image = drawing_to_image(drawing, image_size)
 
         # Debug mode: save visualizations
         if debug and debug_saved < debug_max_samples:
             debug_save_drawing(
-                drawing, image, actions, mask, entry["word"], debug_path, converted
+                drawing,
+                actions,
+                mask,
+                entry["word"],
+                debug_path,
+                converted,
+                use_relative_actions,
             )
             debug_saved += 1
 
